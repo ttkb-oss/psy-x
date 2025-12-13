@@ -306,7 +306,9 @@ fn path_40(file: &str) -> PathBuf {
 
 #[inline]
 fn path_46(file: &str) -> PathBuf {
-    PathBuf::from(format!("{PRIVATE_TEST_DATA_PREFIX}/Psy-Q_46/Psy-Q - 46/{file}"))
+    PathBuf::from(format!(
+        "{PRIVATE_TEST_DATA_PREFIX}/Psy-Q_46/Psy-Q - 46/{file}"
+    ))
 }
 
 #[inline]
@@ -491,7 +493,6 @@ fn test_psyq_46() {
     round_trip(&path_46("LIB/LIBSIO.LIB"));
     round_trip(&path_46("LIB/NOHEAP.OBJ"));
 }
-
 
 #[test]
 fn test_psyq_47() {
