@@ -38,6 +38,10 @@ enum CLICommand {
         /// show disassembly of code for known architectures
         #[clap(short, long)]
         disassemble: bool,
+
+        /// recursively print all OBJ entries in a LIB
+        #[clap(short, long)]
+        recursive: bool,
     },
 
     /// splits a LIB into multiple OBJs
@@ -103,7 +107,14 @@ fn main() -> Result<()> {
                 lib_or_obj,
                 code,
                 disassemble,
-            } => cli::info(&mut std::io::stdout(), &lib_or_obj, code, disassemble)?,
+                recursive,
+            } => cli::info(
+                &mut std::io::stdout(),
+                &lib_or_obj,
+                code,
+                disassemble,
+                recursive,
+            )?,
             CLICommand::Extract { lib } => cli::split(&lib)?,
             CLICommand::Create { lib, objs } => cli::join(&lib, objs)?,
             CLICommand::Add { lib, obj } => cli::add(&lib, &obj)?,
@@ -111,7 +122,9 @@ fn main() -> Result<()> {
             CLICommand::Delete { lib, obj_names } => cli::delete(&lib, obj_names)?,
         },
         None => match args.lib_or_obj {
-            Some(lib_or_obj) => cli::info(&mut std::io::stdout(), &lib_or_obj, false, false)?,
+            Some(lib_or_obj) => {
+                cli::info(&mut std::io::stdout(), &lib_or_obj, false, false, false)?
+            }
             None => {
                 let a = App::command().render_help();
                 eprintln!("{}", a);

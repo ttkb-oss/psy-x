@@ -112,6 +112,7 @@ pub fn psylib_main() -> Result<()> {
                 &PathBuf::from(&args[2]),
                 false,
                 false,
+                false,
             );
         }
         _ => {}

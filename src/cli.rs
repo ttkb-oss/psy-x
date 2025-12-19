@@ -20,6 +20,7 @@ pub fn info(
     lib_or_obj: &Path,
     code: bool,
     disassembly: bool,
+    recursive: bool,
 ) -> Result<()> {
     let o = read(lib_or_obj)?;
     let mut options = display::Options::default();
@@ -28,6 +29,7 @@ pub fn info(
     } else if code {
         options.code_format = display::CodeFormat::Hex;
     }
+    options.recursive = recursive;
     writeln!(write, "{}", display::PsyXDisplayable::wrap(&o, options))?;
     Ok(())
 }

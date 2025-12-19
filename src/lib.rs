@@ -100,7 +100,7 @@ pub mod link;
 #[binrw]
 #[brw(little, magic = b"LIB", assert(!objs.is_empty()))]
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LIB {
     version: u8,
 
@@ -133,9 +133,15 @@ impl display::DisplayWithOptions for LIB {
     fn fmt_with_options(&self, f: &mut fmt::Formatter, options: &display::Options) -> fmt::Result {
         writeln!(f, "Module     Date     Time   Externals defined")?;
         writeln!(f)?;
-        for obj in &self.objs {
-            obj.fmt_with_options(f, options)?;
+        for module in &self.objs {
+            module.fmt_with_options(f, options)?;
             writeln!(f)?;
+
+            if options.recursive {
+                writeln!(f)?;
+                module.obj.fmt_with_options(f, &options.indent())?;
+                writeln!(f)?;
+            }
         }
         Ok(())
     }
@@ -336,6 +342,24 @@ pub struct ModuleMetadata {
     exports: Vec<Export>,
 }
 
+#[inline]
+fn string_to_module_name(name: &str) -> [u8; 8] {
+    let mut module_name: [u8; 8] = [0x20; 8];
+
+    // the unicode path requires care to avoid breaking
+    // multi-byte codepoints and grapheme clusters.
+    let mut size = 0;
+    for (offset, cluster) in name.grapheme_indices(false) {
+        if offset > 7 || (offset + cluster.len()) > 8 {
+            break;
+        }
+        size = offset + cluster.len();
+    }
+
+    module_name[..size].copy_from_slice(&name.as_bytes()[..size]);
+    module_name
+}
+
 /// Converts a [Path] into an appropriate module name. The module
 /// name is the first 8 characters of the file name without anything
 /// following the first `.` (period) character (as defined by
@@ -358,63 +382,64 @@ fn path_to_module_name(path: &Path) -> [u8; 8] {
     let Some(prefix) = path.file_prefix() else {
         panic!("Module paths must contain a file name: {:?}", path);
     };
-
-    let mut module_name: [u8; 8] = [0x20; 8];
     let binding = prefix.to_ascii_uppercase();
 
-    if prefix.is_ascii() {
-        // the ascii path is simple, just copy the bytes
-        let bytes = binding.as_encoded_bytes();
-        let len = cmp::min(bytes.len(), module_name.len());
-        module_name[0..len].copy_from_slice(&bytes[0..len]);
-    } else {
-        // the unicode path requires care to avoid breaking
-        // multi-byte codepoints and grapheme clusters.
+    if !prefix.is_ascii() {
         let Some(prefix_str) = binding.to_str() else {
             panic!("Module path is not valid unicode: {:?}", path);
         };
-
-        let mut size = 0;
-        for (offset, cluster) in prefix_str.grapheme_indices(false) {
-            if offset > 7 || (offset + cluster.len()) > 8 {
-                break;
-            }
-            size = offset + cluster.len();
-        }
-
-        module_name[..size].copy_from_slice(&prefix_str.as_bytes()[..size]);
+        return string_to_module_name(prefix_str);
     }
+
+    // the ascii path is simple, just copy the bytes
+    let bytes = binding.as_encoded_bytes();
+    let mut module_name: [u8; 8] = [0x20; 8];
+    let len = cmp::min(bytes.len(), module_name.len());
+
+    module_name[0..len].copy_from_slice(&bytes[0..len]);
     module_name
 }
 
 impl ModuleMetadata {
-    fn new_from_path(path: &Path, obj: &OBJ) -> Result<Self> {
+    pub fn new(name: String, created: SystemTime, size: u32, exports: Vec<Export>) -> Self {
+        let name = string_to_module_name(&name);
+        let created = created.to_psyq_timestamp();
+        let mut exports = exports;
+        exports.push(Export::empty());
+
+        let offset: u32 = 20 + exports.iter().map(|e| 1 + e.name_size as u32).sum::<u32>();
+        Self {
+            name,
+            created,
+            offset,
+            size: offset + size,
+            exports,
+        }
+    }
+
+    pub fn new_from_path(path: &Path, obj: &OBJ) -> Result<Self> {
         let name = path_to_module_name(path);
 
         let file_metadata = fs::metadata(path)?;
-
         let created = if let Ok(creation_time) = file_metadata.created() {
-            creation_time.to_psyq_timestamp()
+            creation_time
         } else {
-            SystemTime::now().to_psyq_timestamp()
+            SystemTime::now()
         };
-        let mut exports = obj
+        let exports = obj
             .exports()
             .into_iter()
             .map(Export::new)
             .collect::<Vec<Export>>();
-        exports.push(Export::empty());
 
-        let offset: u32 = 20 + exports.iter().map(|e| 1 + e.name_size as u32).sum::<u32>();
-        let size = offset + file_metadata.len() as u32;
+        let size = file_metadata.len() as u32;
 
-        Ok(Self {
-            name,
+        Ok(Self::new(
+            String::from_utf8(name.to_vec())?,
             created,
-            offset,
             size,
             exports,
-        })
+        ))
     }
 
     /// Returns the module name, with trailing whitespace removed.
@@ -516,6 +541,11 @@ pub struct Module {
 }
 
 impl Module {
+    /// Create a new [Module] programmatically
+    pub fn new(obj: OBJ, metadata: ModuleMetadata) -> Self {
+        Self { metadata, obj }
+    }
+
     /// Creates a new [Module] from the file at `path`.
     ///
     /// `path` must point to a valid [OBJ] file.
@@ -574,8 +604,7 @@ impl display::DisplayWithOptions for Module {
                 .map(|e| format!("{e} "))
                 .collect::<Vec<_>>()
                 .join("")
-        )?;
-        Ok(())
+        )
     }
 }
 
@@ -689,6 +718,14 @@ pub struct OBJ {
 }
 
 impl OBJ {
+    pub fn new(sections: Vec<Section>) -> Self {
+        assert!(matches!(sections.last(), Some(Section::NOP)));
+        Self {
+            version: 2,
+            sections,
+        }
+    }
+
     /// Returns the OBJ format version (typically 2).
     pub fn version(&self) -> u8 {
         self.version
@@ -710,20 +747,8 @@ impl OBJ {
             .iter()
             .filter_map({
                 |s| match s {
-                    Section::XDEF(xdef) => {
-                        if xdef.symbol_name_size > 0 {
-                            Some(xdef.symbol_name())
-                        } else {
-                            None
-                        }
-                    }
-                    Section::XBSS(xbss) => {
-                        if xbss.name_size > 0 {
-                            Some(xbss.name())
-                        } else {
-                            None
-                        }
-                    }
+                    Section::XDEF(xdef) => Some(xdef.symbol_name()),
+                    Section::XBSS(xbss) => Some(xbss.name()),
                     _ => None,
                 }
             })
@@ -733,16 +758,13 @@ impl OBJ {
 
 impl fmt::Display for OBJ {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "Header : LNK version {}", self.version)?;
-        for section in &self.sections {
-            writeln!(f, "{}", section)?;
-        }
-        Ok(())
+        self.fmt_with_options(f, &display::Options::default())
     }
 }
 
 impl display::DisplayWithOptions for OBJ {
     fn fmt_with_options(&self, f: &mut fmt::Formatter, options: &display::Options) -> fmt::Result {
+        options.write_indent(f)?;
         writeln!(f, "Header : LNK version {}", self.version)?;
         for section in &self.sections {
             section.fmt_with_options(f, options)?;
@@ -988,7 +1010,6 @@ pub enum Expression {
     //
     // Comparison operators
     //
-
     /// Equality comparison.
     ///
     /// ```asm
@@ -1088,7 +1109,6 @@ pub enum Expression {
     //
     // Arithmetic operators
     //
-
     /// Addition.
     ///
     /// ```asm
@@ -1269,8 +1289,9 @@ pub enum Expression {
     #[brw(magic(64u8))]
     Dashes(Box<Expression>, Box<Expression>),
 
+    //
     // Special operators (primarily for Saturn/SH-2)
-
+    //
     /// Reverse word.
     ///
     /// ```asm
@@ -1376,39 +1397,51 @@ impl fmt::Display for Expression {
             Self::SectionEnd(offset) => write!(f, "sectend({offset:x})"),
 
             // comparison
-            Self::Equals(lhs, rhs) => write!(f, "({}={})", lhs, rhs),
-            Self::NotEquals(lhs, rhs) => write!(f, "({}<>{})", lhs, rhs),
-            Self::LTE(lhs, rhs) => write!(f, "({}<={})", lhs, rhs),
-            Self::LessThan(lhs, rhs) => write!(f, "({}<{})", lhs, rhs),
-            Self::GTE(lhs, rhs) => write!(f, "({}>={})", lhs, rhs),
-            Self::GreaterThan(lhs, rhs) => write!(f, "({}>{})", lhs, rhs),
+            Self::Equals(lhs, rhs) => write!(f, "({lhs}={rhs})"),
+            Self::NotEquals(lhs, rhs) => write!(f, "({lhs}<>{rhs})"),
+            Self::LTE(lhs, rhs) => write!(f, "({lhs}<={rhs})"),
+            Self::LessThan(lhs, rhs) => write!(f, "({lhs}<{rhs})"),
+            Self::GTE(lhs, rhs) => write!(f, "({lhs}>={rhs})"),
+            Self::GreaterThan(lhs, rhs) => write!(f, "({lhs}>{rhs})"),
 
             // arithmatic
-            Self::Add(lhs, rhs) => write!(f, "({}+{})", lhs, rhs),
-            Self::Subtract(lhs, rhs) => write!(f, "({}-{})", lhs, rhs),
-            Self::Multiply(lhs, rhs) => write!(f, "({}*{})", lhs, rhs),
-            Self::Divide(lhs, rhs) => write!(f, "({}/{})", lhs, rhs),
-            Self::And(lhs, rhs) => write!(f, "({}&{})", lhs, rhs),
-            Self::Or(lhs, rhs) => write!(f, "({}!{})", lhs, rhs),
-            Self::XOR(lhs, rhs) => write!(f, "({}^{})", lhs, rhs),
-            Self::LeftShift(lhs, rhs) => write!(f, "({}<<{})", lhs, rhs),
-            Self::RightShift(lhs, rhs) => write!(f, "({}>>{})", lhs, rhs),
-            Self::Mod(lhs, rhs) => write!(f, "({}%%{})", lhs, rhs),
-            Self::Dashes(lhs, rhs) => write!(f, "({}---{})", lhs, rhs),
+            Self::Add(lhs, rhs) => write!(f, "({lhs}+{rhs})"),
+            Self::Subtract(lhs, rhs) => write!(f, "({lhs}-{rhs})"),
+            Self::Multiply(lhs, rhs) => write!(f, "({lhs}*{rhs})"),
+            Self::Divide(lhs, rhs) => write!(f, "({lhs}/{rhs})",),
+            Self::And(lhs, rhs) => write!(f, "({lhs}&{rhs})"),
+            Self::Or(lhs, rhs) => write!(f, "({lhs}!{rhs})"),
+            Self::XOR(lhs, rhs) => write!(f, "({lhs}^{rhs})"),
+            Self::LeftShift(lhs, rhs) => write!(f, "({lhs}<<{rhs})"),
+            Self::RightShift(lhs, rhs) => write!(f, "({lhs}>>{rhs})"),
+            Self::Mod(lhs, rhs) => write!(f, "({lhs}%%{rhs})"),
+            Self::Dashes(lhs, rhs) => write!(f, "({lhs}---{rhs})"),
 
             // keyword
-            Self::Revword(lhs, rhs) => write!(f, "({}-revword-{})", lhs, rhs),
-            Self::Check0(lhs, rhs) => write!(f, "({}-check0-{})", lhs, rhs),
-            Self::Check1(lhs, rhs) => write!(f, "({}-check1-{})", lhs, rhs),
-            Self::BitRange(lhs, rhs) => write!(f, "({}-bitrange-{})", lhs, rhs),
-            Self::ArshiftChk(lhs, rhs) => write!(f, "({}-arshift_chk-{})", lhs, rhs),
+            Self::Revword(lhs, rhs) => write!(f, "({lhs}-revword-{rhs})"),
+            Self::Check0(lhs, rhs) => write!(f, "({lhs}-check0-{rhs})"),
+            Self::Check1(lhs, rhs) => write!(f, "({lhs}-check1-{rhs})"),
+            Self::BitRange(lhs, rhs) => write!(f, "({lhs}-bitrange-{rhs})"),
+            Self::ArshiftChk(lhs, rhs) => write!(f, "({lhs}-arshift_chk-{rhs})"),
         }
     }
 }
 
 /// A relocation patch to be applied by the linker.
 ///
-/// Patches modify code or data at a specific offset using a calculated expression
+/// Patches modify code or data at a specific offset using a calculated expression.
+///
+/// # Types
+///
+/// | Tag | Description                                              | Expression             |
+/// |-----|----------------------------------------------------------|------------------------|
+/// | 8   | Write 32-bit expression value (big-endian?)              | ``                     |
+/// | 10  | Unknown                                                  |                        |
+/// | 16  | Write 32-bit expression value (little-endian?)           | ``                     |
+/// | 30  | Possibly related to register allocation.                 |                        |
+/// | 74  | Function symbol relocation (24-bit, little-endian).      | `[14]`                 |
+/// | 82  | Copy expression high 16-bytes into instruction low bytes | `($20+sectbase(f001))` |
+/// | 84  | Copy expression low 16-bytes into instruction low bytes  | `($20+sectbase(f001))` |
 ///
 /// # Structure on Disk
 ///
@@ -2201,8 +2234,9 @@ pub enum Section {
     #[brw(magic(48u8))]
     XBSS(XBSS),
 
+    //
     // Source line debugger information
-
+    //
     /// Increment line number.
     ///
     /// # Structure on Disk
@@ -2308,7 +2342,6 @@ pub enum Section {
     //
     // Function and block debug information
     //
-
     /// Function start marker.
     ///
     /// # Structure on Disk
@@ -2356,7 +2389,6 @@ pub enum Section {
     //
     // Type and variable definitions
     //
-
     /// Variable/type definition.
     ///
     /// # Structure on Disk
@@ -2401,6 +2433,7 @@ impl fmt::Display for Section {
 
 impl display::DisplayWithOptions for Section {
     fn fmt_with_options(&self, f: &mut fmt::Formatter, options: &display::Options) -> fmt::Result {
+        options.write_indent(f)?;
         match self {
             Self::NOP => write!(f, "0 : End of file"),
             Self::Code(code) => {
@@ -2409,15 +2442,25 @@ impl display::DisplayWithOptions for Section {
                     display::CodeFormat::Disassembly => {
                         writeln!(f, "\n")?;
                         for instruction in code.code.chunks(4) {
-                            let ins = u32::from_le_bytes(instruction.try_into().unwrap());
-                            let asm = Instruction::new(ins, 0x80000000, InstrCategory::CPU)
-                                .disassemble(None, 0);
-                            writeln!(f, "    /* {ins:08x} */   {asm}")?;
+                            if instruction.len() == 4 {
+                                let ins = u32::from_le_bytes(instruction.try_into().unwrap());
+                                let asm = Instruction::new(ins, 0x80000000, InstrCategory::CPU)
+                                    .disassemble(None, 0);
+                                options.write_indent(f)?;
+                                writeln!(f, "    /* {ins:08x} */   {asm}")?;
+                            } else {
+                                write!(f, "    /* ")?;
+                                for byte in instruction {
+                                    write!(f, "{byte:02x}")?;
+                                }
+                                writeln!(f, " */ ; invalid")?;
+                            }
                         }
                     }
                     display::CodeFormat::Hex => {
                         writeln!(f, "\n")?;
                         for (i, chunk) in code.code.chunks(16).enumerate() {
+                            options.write_indent(f)?;
                             write!(f, "{:04x}:", i * 16)?;
                             for byte in chunk {
                                 write!(f, " {:02x}", byte)?;
@@ -2428,8 +2471,10 @@ impl display::DisplayWithOptions for Section {
                     display::CodeFormat::None => (),
                 }
                 Ok(())
-            },
-            Self::RunAtOffset(section_id, offset) => write!(f, "4 : Run at offset {offset:x} in {section_id:x}"),
+            }
+            Self::RunAtOffset(section_id, offset) => {
+                write!(f, "4 : Run at offset {offset:x} in {section_id:x}")
+            }
             Self::SectionSwitch(section_id) => write!(f, "6 : Switch to section {section_id:x}"),
             Self::BSS(size) => {
                 let uninit = if is_en_gb() {
@@ -2480,44 +2525,26 @@ impl display::DisplayWithOptions for Section {
                 symbol.name(),
                 symbol.sym_type,
             ),
-            Self::ByteSizeRegister(register) => write!(
-                f,
-                "22 : Set byte size register to reg offset {register}",
-            ),
-            Self::WordSizeRegister(register) => write!(
-                f,
-                "24 : Set word size register to reg offset {register}",
-            ),
-            Self::LongSizeRegister(register) => write!(
-                f,
-                "26 : Set long size register to reg offset {register}",
-            ),
+            Self::ByteSizeRegister(register) => {
+                write!(f, "22 : Set byte size register to reg offset {register}",)
+            }
+            Self::WordSizeRegister(register) => {
+                write!(f, "24 : Set word size register to reg offset {register}",)
+            }
+            Self::LongSizeRegister(register) => {
+                write!(f, "26 : Set long size register to reg offset {register}",)
+            }
             Self::Filename(filename) => write!(
                 f,
                 "28 : Define file number {:x} as \"{}\"",
                 filename.number,
                 filename.name()
             ),
-            Self::SetToFile(file, line) => write!(
-                f,
-                "30 : Set to {file:x}, line {line}",
-            ),
-            Self::SetToLine(line) => write!(
-                f,
-                "32 : Set to line {line}",
-            ),
-            Self::IncrementLineNumber => write!(
-                f,
-                "34 : Increment line number",
-            ),
-            Self::IncrementLineNumberByte(num) => write!(
-                f,
-                "36 : Increment line number by {num}",
-            ),
-            Self::IncrementLineNumberWord(num) => write!(
-                f,
-                "38 : Increment line number by {num}",
-            ),
+            Self::SetToFile(file, line) => write!(f, "30 : Set to {file:x}, line {line}",),
+            Self::SetToLine(line) => write!(f, "32 : Set to line {line}",),
+            Self::IncrementLineNumber => write!(f, "34 : Increment line number",),
+            Self::IncrementLineNumberByte(num) => write!(f, "36 : Increment line number by {num}",),
+            Self::IncrementLineNumberWord(num) => write!(f, "38 : Increment line number by {num}",),
             Self::VeryLocalSymbol(symbol) => write!(
                 f,
                 "40 : Very local symbol '{}' at offset {:x} in section {:x}",
@@ -2525,10 +2552,9 @@ impl display::DisplayWithOptions for Section {
                 symbol.offset,
                 symbol.section,
             ),
-            Self::Set3ByteRegister(register) => write!(
-                f,
-                "42 : Set 3-byte size register to reg offset {register}",
-            ),
+            Self::Set3ByteRegister(register) => {
+                write!(f, "42 : Set 3-byte size register to reg offset {register}",)
+            }
             Self::SetMXInfo(set_mx_info) => write!(
                 f,
                 "44 : Set MX info at offset {:x} to {:x}",
@@ -2568,7 +2594,9 @@ impl display::DisplayWithOptions for Section {
             Self::RepeatWord(count) => write!(f, "64 : Repeat word {count} times"),
             Self::RepeatLong(count) => write!(f, "66 : Repeat long {count} times"),
             Self::ProcedureCall(call) => write!(f, "68 : <<<<Unimplemented>>>> {:?}", call),
-            Self::ProcedureDefinition(definition) => write!(f, "68 : <<<<Unimplemented>>>> {:?}", definition),
+            Self::ProcedureDefinition(definition) => {
+                write!(f, "68 : <<<<Unimplemented>>>> {:?}", definition)
+            }
             Self::Repeat3Byte(count) => write!(f, "70 : Repeat 3-byte {count} times"),
             Self::FunctionStart(start) => write!(
                 f,
@@ -2771,23 +2799,28 @@ mod test {
         assert_eq!(lib.version, 1);
         // assert_eq!(lib.modules().len(), 1);
 
-        let obj = lib.modules().first().expect("obj[0]");
-        assert_eq!(obj.name(), "A56");
-        assert_eq!(obj.metadata.created, 2167152815);
-        assert_eq!(obj.metadata.offset, 26);
-        assert_eq!(obj.metadata.size, 142);
-        assert_eq!(obj.metadata.exports.len(), 2);
-        assert_eq!(obj.exports().len(), 1);
+        let module = lib.modules().first().expect("modules[0]");
+        assert_eq!(module.obj.version(), 2);
+        assert_eq!(module.name(), "A56");
+        assert_eq!(module.metadata.created, 2167152815);
+        assert_eq!(module.metadata.offset, 26);
+        assert_eq!(module.metadata.size, 142);
+        assert_eq!(module.metadata.exports.len(), 2);
+        assert_eq!(module.exports().len(), 1);
 
-        let export = obj.metadata.exports.first().expect("obj[0].exports[0]");
+        let export = module
+            .metadata
+            .exports
+            .first()
+            .expect("modules[0].exports[0]");
         assert_eq!(export.name_size, 4);
         assert_eq!(export.name(), "exit");
 
-        let lnk = &obj.obj;
+        let lnk = &module.obj;
         assert_eq!(lnk.version, 2);
 
-        let Section::CPU(cpu) = lnk.sections.first().expect("obj[0].obj.sections[0]") else {
-            panic!("expected a section");
+        let Section::CPU(cpu) = lnk.sections.first().expect("module[0].obj.sections[0]") else {
+            unreachable!();
         };
         assert_eq!(*cpu, cputype::MIPS_R3000);
         /*

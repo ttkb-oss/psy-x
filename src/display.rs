@@ -5,7 +5,7 @@ use std::default::Default;
 use std::fmt::{Display, Formatter, Result};
 
 /// The format used to display code.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub enum CodeFormat {
     #[default]
     None,
@@ -14,13 +14,28 @@ pub enum CodeFormat {
 }
 
 /// Options for displaying [LIB](super::LIB) and [OBJ](super::OBJ) data.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     /// The code format to emit
     pub code_format: CodeFormat,
 
     /// Whether or not to recurse into each module of a [LIB](super::LIB)
     pub recursive: bool,
+
+    /// Level to indent
+    pub indent_level: u8,
+}
+
+impl Options {
+    pub fn indent(&self) -> Self {
+        let mut o = self.clone();
+        o.indent_level += 1;
+        o
+    }
+
+    pub fn write_indent(&self, f: &mut Formatter) -> Result {
+        write!(f, "{:width$}", "", width = 4 * (self.indent_level as usize))
+    }
 }
 
 /// Display something with options.

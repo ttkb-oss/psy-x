@@ -69,7 +69,7 @@ fn test_info_lib() -> Result<()> {
     let p = format!("{PSYQ_PREFIX}/3.3/PSX/LIB/LIBSN.LIB");
     let mut output: Vec<u8> = Vec::new();
 
-    cli::info(&mut output, Path::new(&p), false, false)?;
+    cli::info(&mut output, Path::new(&p), false, false, false)?;
 
     assert_eq!("\
         Module     Date     Time   Externals defined\n\
@@ -138,7 +138,7 @@ fn test_info_obj() -> Result<()> {
     let p = format!("{PSYQ_PREFIX}/3.3/PSX/LIB/2MBYTE.OBJ");
     let mut output: Vec<u8> = Vec::new();
 
-    cli::info(&mut output, Path::new(&p), false, false)?;
+    cli::info(&mut output, Path::new(&p), false, false, false)?;
 
     assert_eq!(
         "\

@@ -14,6 +14,8 @@ Change Log
 * `OBJ::sections` is now private. Use `OBJ::sections()` instead.
 * Added remaining section types that don't have previously seen examples.
   `Section::ProcedureCall` and `Section::ProcedureDefinition` are incorrect.
+* Added `-r`/`--recursive` option for `psyk list` which will print all
+  all `OBJ` data for each module in a `LIB`
 * File format documentation for all types `LIB` and `OBJ` types.
 
 0.3.1 - December 15, 2025
